@@ -285,8 +285,17 @@ jobs:
         if: github.ref_type == 'tag'
         run: |
           cd release-files
+          # upload-artifact keeps the paths below the common root of the files, so the images arrive under
+          # meta-hailo-soc/ and the scripts under meta-sysele-bsp/. The archive holds everything at its root,
+          # which is where program_spi_flash.sh looks for the images.
           cp -p meta-sysele-bsp/scripts/* .
-          chmod +x *.sh *.py hailo15_* uart_* 2>/dev/null || true
+          cp -p meta-hailo-soc/build/tmp/deploy/images/astrial-h15/* .
+          rm -rf meta-hailo-soc meta-sysele-bsp
+          chmod +x *.sh *.py hailo15_spi_flash_program uart_boot_fw_loader
+          for f in core-image-hailo-dev-astrial-h15.wic hailo-update-image-astrial-h15.swu \
+                   u-boot-tfa.itb scu_bl_cfg_a.bin program_spi_flash.sh; do
+            [ -e "$f" ] || { echo "ERROR: $f is not in the archive after flattening" >&2; exit 1; }
+          done
           NAME="qbastrial-h15-yocto-build-${{ github.ref_name }}"
           echo "ARCHIVE_NAME=$NAME" >> "$GITHUB_ENV"
           tar -czf "../$NAME.tar.gz" .
