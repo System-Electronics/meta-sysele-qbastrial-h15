@@ -7,12 +7,20 @@ run-name: QBAstrial H15 Build • ${{ github.ref_name }}
 # No pull_request trigger: the build uses the signing keys, which a fork must not reach.
 on:
   workflow_dispatch:
+    inputs:
+      sbom:
+        description: "none, standard (SPDX and cve-check) or full (also the checksums). Empty: the repository variable SYSELE_SBOM, or none."
+        type: string
+        default: ''
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+'
 
 env:
+  # SBOM level, see meta-sysele-bsp/kas/astrial-h15-machine.yml: none, standard (SPDX and cve-check) or full.
+  # cve-check needs the NVD database, which the build machine keeps: until it has one, the variable stays unset.
+  SYSELE_SBOM: ${{ inputs.sbom || vars.SYSELE_SBOM || 'none' }}
   # meta-sysele-astrial-h15, tag v1.2.2.
   BASE_LAYER_REPO: System-Electronics-Org/meta-sysele-astrial-h15
   BASE_LAYER_REF: 6d15fef02e0e5547f48db8dd0b255d4b74238ba8
@@ -161,7 +169,7 @@ jobs:
           export BB_CONSOLELOG=""
           export BB_DEFAULT_TASK="build"
           export GITHUB_ACTIONS_BUILD=1
-          export BB_ENV_PASSTHROUGH_ADDITIONS="QBA_SECURE_ASSETS_DIR QBA_SWU_PRIVATE_KEY SYSELE_BSP_VERSION GITHUB_SHA GITHUB_REPOSITORY GITHUB_RUN_ID BB_ISOLATE_NETWORK BB_NO_NETWORK BITBAKE_UI_OPTS BB_LOGCONFIG BB_CONSOLELOG BB_DEFAULT_TASK GITHUB_ACTIONS_BUILD"
+          export BB_ENV_PASSTHROUGH_ADDITIONS="QBA_SECURE_ASSETS_DIR QBA_SWU_PRIVATE_KEY SYSELE_BSP_VERSION SYSELE_SBOM GITHUB_SHA GITHUB_REPOSITORY GITHUB_RUN_ID BB_ISOLATE_NETWORK BB_NO_NETWORK BITBAKE_UI_OPTS BB_LOGCONFIG BB_CONSOLELOG BB_DEFAULT_TASK GITHUB_ACTIONS_BUILD"
 
           set -e
           if ! kas build qbastrial-h15-ci.yml -- -k; then
@@ -232,6 +240,10 @@ jobs:
             fi
           done
 
+      - name: Build the SBOMs
+        if: env.SYSELE_SBOM != 'none'
+        run: bash meta-sysele-bsp/ci/build-sboms.sh
+
       - name: Archive Build Artifacts
         id: upload_build
         uses: actions/upload-artifact@v4
@@ -251,7 +263,25 @@ jobs:
             meta-hailo-soc/build/tmp/deploy/images/astrial-h15/u-boot-initial-env
             meta-hailo-soc/build/tmp/deploy/images/astrial-h15/customer_certificate.bin
             meta-hailo-soc/build/tmp/deploy/images/astrial-h15/u-boot-tfa.itb
+            meta-hailo-soc/build/tmp/deploy/images/astrial-h15/*.spdx.json
+            meta-hailo-soc/build/tmp/deploy/images/astrial-h15/*.spdx.index.json
+            meta-hailo-soc/build/tmp/deploy/images/astrial-h15/*.spdx.tar.zst
+            meta-hailo-soc/build/tmp/log/cve/cve-summary.json
+            meta-hailo-soc/build/tmp/log/cve/cve-summary
             meta-sysele-bsp/scripts/
+          if-no-files-found: error
+
+      - name: Archive SBOMs
+        id: upload_sbom
+        if: env.SYSELE_SBOM != 'none'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qbastrial-h15-sbom
+          path: |
+            meta-hailo-soc/build/tmp/deploy/images/astrial-h15/core-image-hailo-dev-astrial-h15-build.spdx.json
+            meta-hailo-soc/build/tmp/deploy/images/astrial-h15/core-image-hailo-dev-astrial-h15-deployed.spdx.json
+            meta-hailo-soc/build/tmp/deploy/images/astrial-h15/*.spdx.tar.zst
+            meta-hailo-soc/build/tmp/log/cve/cve-summary.json
           if-no-files-found: error
 
       - name: Archive Build Logs
@@ -262,6 +292,7 @@ jobs:
           name: qbastrial-h15-build-logs
           path: |
             meta-hailo-soc/build/tmp/log/
+            meta-hailo-soc/build/buildhistory/
             failure-logs/
           if-no-files-found: warn
 
@@ -270,9 +301,11 @@ jobs:
         env:
           BUILD_URL: ${{ steps.upload_build.outputs.artifact-url }}
           LOGS_URL: ${{ steps.upload_logs.outputs.artifact-url }}
+          SBOM_URL: ${{ steps.upload_sbom.outputs.artifact-url }}
         run: |
           echo "Image and flashing files: ${BUILD_URL:-not produced, the build did not get that far}"
           echo "Build logs:               ${LOGS_URL:-not produced}"
+          echo "SBOMs and CVE report:     ${SBOM_URL:-not produced, this build did not make one}"
 
       - name: Download Build Artifacts for Release
         if: github.ref_type == 'tag'
@@ -290,6 +323,7 @@ jobs:
           # which is where program_spi_flash.sh looks for the images.
           cp -p meta-sysele-bsp/scripts/* .
           cp -p meta-hailo-soc/build/tmp/deploy/images/astrial-h15/* .
+          cp -rp meta-hailo-soc/build/tmp/log/cve/* . 2>/dev/null || true
           rm -rf meta-hailo-soc meta-sysele-bsp
           chmod +x *.sh *.py hailo15_spi_flash_program uart_boot_fw_loader
           for f in core-image-hailo-dev-astrial-h15.wic hailo-update-image-astrial-h15.swu \
