@@ -1,28 +1,38 @@
 name: QBAstrial H15 Yocto Build
 
-run-name: QBAstrial H15 Build • ${{ github.ref_name }}
+run-name: QBAstrial H15 Build • ${{ github.ref_name }} • ${{ github.event_name }}
 
 # Builds the QBAstrial H15 image on top of meta-sysele-astrial-h15 at a pinned commit.
 # A tag vX.Y.Z publishes a release; a manual run keeps the artifacts of the run.
 # No pull_request trigger: the build uses the signing keys, which a fork must not reach.
+#
+# Runs on the organization's self-hosted runner (one machine, shared with meta-sysele-astrial-h15
+# and future products): free, persistent cache, and the CVE database kept fresh by the VPS timer,
+# instead of a paid GitHub-hosted runner building and fetching everything from scratch each time.
 on:
   workflow_dispatch:
     inputs:
       sbom:
-        description: "none, standard (SPDX and cve-check) or full (also the checksums). Empty: the repository variable SYSELE_SBOM, or none."
+        description: "none, standard (SPDX and cve-check) or full (also the checksums). Empty: the repository variable SYSELE_SBOM, or standard."
         type: string
         default: ''
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+'
+  schedule:
+    # Primo del mese, poco dopo l'aggiornamento notturno del database CVE (03:30 UTC) e dopo
+    # bump-poky di meta-sysele-astrial-h15 (03:00 UTC): canarino, non pubblica nulla di
+    # permanente (github.ref_type non e' 'tag' su uno schedulato).
+    - cron: '0 4 1 * *'
 
 env:
-  # SBOM level, see meta-sysele-bsp/kas/astrial-h15-machine.yml: none, standard (SPDX and cve-check) or full.
-  # cve-check needs the NVD database, which the build machine keeps: until it has one, the variable stays unset.
-  SYSELE_SBOM: ${{ inputs.sbom || vars.SYSELE_SBOM || 'none' }}
+  # SBOM level, see meta-sysele-bsp/kas/astrial-h15-machine.yml: none, standard (SPDX and cve-check)
+  # or full. QBAstrial e' il prodotto consegnato (meta-sysele-astrial-h15 non lo e'): la SBOM e'
+  # importante qui, quindi il default e' "standard", non "none".
+  SYSELE_SBOM: ${{ inputs.sbom || vars.SYSELE_SBOM || 'standard' }}
   # meta-sysele-astrial-h15, tag v1.2.2.
-  BASE_LAYER_REPO: System-Electronics-Org/meta-sysele-astrial-h15
+  BASE_LAYER_REPO: System-Electronics/meta-sysele-astrial-h15
   BASE_LAYER_REF: 6d15fef02e0e5547f48db8dd0b255d4b74238ba8
   HAILO_SOC_TAG: 1.12.0
   # sha256 of `openssl rsa -noout -modulus` of the customer key pair (modulus 9E71...).
@@ -30,7 +40,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-large-runner
+    runs-on: self-hosted
     permissions:
       contents: write
     steps:
@@ -80,19 +90,20 @@ jobs:
           echo "SWU signing key verified. Public key fingerprint: $pub"
           echo "SWU_PUBKEY_FINGERPRINT=$pub" >> "$GITHUB_ENV"
 
-      - name: Install Dependencies
+      - name: Configure environment
         run: |
           echo "BB_ISOLATE_NETWORK=0" >> $GITHUB_ENV
           echo "BB_NO_NETWORK=0" >> $GITHUB_ENV
-          sudo apt-get update
-          sudo apt-get install -y gawk wget git diffstat unzip texinfo gcc build-essential \
-            chrpath socat cpio python3 python3-pip python3-pexpect xz-utils debianutils \
-            iputils-ping python3-git python3-jinja2 libegl1 libsdl1.2-dev \
-            python3-subunit mesa-common-dev zstd liblz4-tool file locales libacl1 \
-            curl python-is-python3 bmap-tools u-boot-tools
-          sudo locale-gen en_US.UTF-8
-          sudo pip3 install "kas==5.3"
-          kas --version
+
+      - name: Install KAS
+        run: |
+          # Niente "sudo apt-get" qui: l'utente del runner non ha privilegi di root. I
+          # pacchetti di sistema per la build (build-essential, gawk, texinfo, python3-venv,
+          # ...) sono gia' installati una volta sola sulla macchina (condivisa con
+          # meta-sysele-astrial-h15, stesso elenco). Qui creiamo solo il venv per kas.
+          python3 -m venv "$RUNNER_TEMP/kas-venv"
+          "$RUNNER_TEMP/kas-venv/bin/pip" install "kas==5.3"
+          echo "$RUNNER_TEMP/kas-venv/bin" >> "$GITHUB_PATH"
 
       - name: Checkout this layer
         uses: actions/checkout@v4
@@ -106,6 +117,20 @@ jobs:
           ref: ${{ env.BASE_LAYER_REF }}
           path: meta-sysele-bsp
 
+      - name: Persistent Yocto cache on the runner
+        # ~/yocto-cache/qbastrial-h15 sta fuori da _work: sopravvive a una workspace ripulita
+        # o a un runner riregistrato. E' lo stesso runner usato da meta-sysele-astrial-h15 e
+        # da futuri prodotti, quindi sstate e downloads sono separati per prodotto; il
+        # database CVE invece e' condiviso (non e' specifico di un prodotto), tenuto
+        # aggiornato dal timer della VPS: da qui un link CVE_CHECK -> ../cve-db.
+        if: runner.environment == 'self-hosted'
+        run: |
+          set -euo pipefail
+          PERSIST="$HOME/yocto-cache/qbastrial-h15"
+          mkdir -p "$PERSIST"
+          ln -sfn ../cve-db "$PERSIST/CVE_CHECK"
+          ls -ld "$PERSIST"
+
       - name: Setup Build Environment
         run: |
           git clone --branch "$HAILO_SOC_TAG" --single-branch \
@@ -114,6 +139,7 @@ jobs:
           git submodule update --init --recursive
           cp -r ../meta-sysele-bsp ./meta-sysele-bsp
           cp -r ../meta-sysele-qbastrial-h15 ./meta-sysele-qbastrial-h15
+          ln -sfn "$HOME/yocto-cache/qbastrial-h15" yocto-cache
 
           cat > qbastrial-h15-ci.yml <<'KAS'
           header:
@@ -129,6 +155,20 @@ jobs:
           KAS
           echo "===== qbastrial-h15-ci.yml ====="
           cat qbastrial-h15-ci.yml
+
+      - name: Check the CVE database on the runner
+        if: env.SYSELE_SBOM != 'none' && runner.environment == 'self-hosted'
+        run: |
+          # Il database lo tiene aggiornato il timer della VPS. Senza, la build prosegue ma
+          # il referto CVE manca, e una release senza referto non deve passare inosservata.
+          DB="$HOME/yocto-cache/cve-db/nvdcve_2-2.db"
+          if [ ! -s "$DB" ]; then
+            echo "::error::No CVE database at $DB: the VPS update timer has not produced one"
+            exit 1
+          fi
+          AGE=$(( ( $(date +%s) - $(stat -c %Y "$DB") ) / 3600 ))
+          echo "CVE database: $(du -h "$DB" | cut -f1), updated ${AGE} h ago"
+          [ "$AGE" -le 48 ] || echo "::warning::CVE database is ${AGE} h old"
 
       - name: Create Patch for BitBake Network Isolation
         run: |
