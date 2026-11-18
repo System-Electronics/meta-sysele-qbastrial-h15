@@ -4,6 +4,25 @@
 # Seconds the kernel waits for user space to open /dev/watchdog on the eMMC boot.
 QBA_WATCHDOG_OPEN_TIMEOUT ?= "60"
 
+do_configure:prepend() {
+    # scripts/check-config.sh concatenates all Kconfig files with
+    # `cat $(find ...)`. If one doesn't end with a newline
+    # (drivers/pinctrl/hailo/Kconfig, Hailo's source), its last line merges
+    # with the first line of the next file in `find`'s order, hiding
+    # `config INPUT` (drivers/input/Kconfig): "You must add new CONFIG
+    # options using Kconfig". `find`'s order depends on the filesystem, so
+    # this only shows up on some machines. Same fix as on meta-sysele-astrial-h15,
+    # ported here because this build pins an older base-layer commit that
+    # predates it.
+    find ${S} -name 'Kconfig*' -type f | while read -r f; do
+        # if, not `[ ] &&`: on the last file the test is false, and bitbake's
+        # shell runs with set -e, so a status 1 would fail the whole function.
+        if [ -n "$(tail -c1 "$f")" ]; then
+            echo >> "$f"
+        fi
+    done
+}
+
 do_configure:append() {
     if ! grep -q 'QBAstrial: console on UART0' ${S}/arch/arm/dts/astrial-h15.dts; then
         cat >> ${S}/arch/arm/dts/astrial-h15.dts <<'DTS'
