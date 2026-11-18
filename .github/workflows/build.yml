@@ -376,6 +376,21 @@ jobs:
           cd ..
           ls -lh "$NAME.tar.gz"
 
+      - name: Prepare individual SBOM and CVE assets for the release
+        # Same files as inside the tar.gz, published again on their own so
+        # anyone who only wants the SPDX or the CVE report does not have to
+        # download and extract the whole archive.
+        if: github.ref_type == 'tag' && env.SYSELE_SBOM != 'none'
+        run: |
+          set -euo pipefail
+          cd release-files
+          cp -p core-image-hailo-dev-astrial-h15-build.spdx.json "../qbastrial-h15-${{ github.ref_name }}-build.spdx.json"
+          cp -p core-image-hailo-dev-astrial-h15-deployed.spdx.json "../qbastrial-h15-${{ github.ref_name }}-deployed.spdx.json"
+          cp -p cve-summary.json "../qbastrial-h15-${{ github.ref_name }}-cve-summary.json"
+          cp -p cve-summary "../qbastrial-h15-${{ github.ref_name }}-cve-summary.txt"
+          cd ..
+          ls -lh "qbastrial-h15-${{ github.ref_name }}"-*.spdx.json "qbastrial-h15-${{ github.ref_name }}"-cve-summary.*
+
       - name: Publish the release for the pushed tag
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v3
@@ -396,7 +411,17 @@ jobs:
             `${{ env.SWU_PUBKEY_FINGERPRINT }}` (sha256 of the DER, first 16 hex digits).
 
             Flashing requires Hailo's `hailo15_board_tools`, not included.
-          files: ${{ env.ARCHIVE_NAME }}.tar.gz
+
+            If the build produced an SBOM (`*-build.spdx.json`, `*-deployed.spdx.json`: software bill of materials,
+            SPDX 2.2) and a CVE report (`cve-summary.json`, `cve-summary`), they are also attached to this release
+            individually (`qbastrial-h15-${{ github.ref_name }}-*`), for anyone who only wants those and not the
+            whole archive.
+          files: |
+            ${{ env.ARCHIVE_NAME }}.tar.gz
+            qbastrial-h15-*-build.spdx.json
+            qbastrial-h15-*-deployed.spdx.json
+            qbastrial-h15-*-cve-summary.json
+            qbastrial-h15-*-cve-summary.txt
           prerelease: ${{ contains(github.ref_name, '-rc') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
