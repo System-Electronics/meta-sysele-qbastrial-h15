@@ -105,6 +105,13 @@ jobs:
           "$RUNNER_TEMP/kas-venv/bin/pip" install "kas==5.3"
           echo "$RUNNER_TEMP/kas-venv/bin" >> "$GITHUB_PATH"
 
+      - name: Clean leftovers of previous runs
+        run: |
+          # The runner is persistent: the workspace survives between runs, and
+          # `git clone meta-hailo-soc` would fail on the second one. The Yocto
+          # cache lives in yocto-cache/, which this does not touch.
+          rm -rf meta-hailo-soc release-files failure-logs /tmp/failed.txt
+
       - name: Checkout this layer
         uses: actions/checkout@v4
         with:
