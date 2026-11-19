@@ -64,3 +64,9 @@ bitbake hailo-update-image
 `BASE_LAYER_REF`, verifies the keys, builds with kas and, on a tag, publishes the release. Secrets:
 `HAILO_CUSTOMER_KEYPAIR` (secure boot) and `SWU_SIGNING_KEY` (SWU signing). The run stops before the build if either is
 missing or invalid.
+
+Tag scheme `vMAJOR.MINOR.PATCH`, release candidates `-rcN`:
+
+- major = Yocto line, same as `meta-sysele-astrial-h15` (kirkstone 1, scarthgap 2);
+- minor = relationship with the pinned `BASE_LAYER_REF`;
+- patch = everything else, even when it changes behavior.
