@@ -1,0 +1,155 @@
+name: Auto-bump base layer (meta-sysele-astrial-h15)
+
+# Monthly schedule: checks for a newer tag of meta-sysele-astrial-h15 than the
+# current BASE_LAYER_REF pin in build.yml. If found, opens a bump PR and
+# validates it with an end-to-end build (no-cache, no-release) in the same
+# run. No auto-merge, no push to main: merge is manual, only after a green
+# validation. Same pattern as meta-sysele-astrial-h15's own bump-poky.yml,
+# but for this repo's pin of that repo instead of poky itself.
+on:
+  schedule:
+    - cron: '0 5 1 * *'   # first of the month, 05:00 UTC, after main.yml's own canary at 04:00
+  workflow_dispatch:
+
+jobs:
+  detect-and-open:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      new_ref: ${{ steps.bump.outputs.new_ref }}
+      new_tag: ${{ steps.bump.outputs.new_tag }}
+      branch: ${{ steps.bump.outputs.branch }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Detect a newer meta-sysele-astrial-h15 tag and open a bump PR
+        id: bump
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          FILE=.github/workflows/build.yml
+
+          CURRENT=$(grep -oP '^  BASE_LAYER_REF: \K[0-9a-f]{40}' "$FILE")
+          LATEST_TAG=$(gh api repos/System-Electronics/meta-sysele-astrial-h15/tags --jq '.[0].name // empty')
+          LATEST=$(gh api repos/System-Electronics/meta-sysele-astrial-h15/tags --jq '.[0].commit.sha // empty')
+
+          echo "Current pin: $CURRENT | latest upstream tag: ${LATEST_TAG:-<none>} (${LATEST:-<none>})"
+
+          if [ -z "$LATEST" ] || [ -z "$CURRENT" ]; then
+            echo "::warning::Could not determine the tags (LATEST='$LATEST' CURRENT='$CURRENT'). Skipping."
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$LATEST" = "$CURRENT" ]; then
+            echo "Already up to date ($CURRENT). Nothing to do."
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BRANCH="bump/base-layer-${LATEST_TAG}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch $BRANCH already exists on origin, skipping (PR likely already open)."
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Only the pin and its comment change, never anything else in the file.
+          sed -i "s/^  BASE_LAYER_REF: [0-9a-f]\{40\}/  BASE_LAYER_REF: ${LATEST}/" "$FILE"
+          sed -i "s/^  # meta-sysele-astrial-h15, tag v[0-9][0-9.]*\./  # meta-sysele-astrial-h15, tag ${LATEST_TAG}./" "$FILE"
+          git diff -- "$FILE"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -am "ci: bump base layer to meta-sysele-astrial-h15 ${LATEST_TAG}"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --base "$DEFAULT_BRANCH" \
+            --head "$BRANCH" \
+            --title "ci: bump base layer to meta-sysele-astrial-h15 ${LATEST_TAG}" \
+            --body "$(cat <<EOF
+          Automatic base-layer pin bump in \`${FILE}\`: **${CURRENT:0:10} -> ${LATEST_TAG} (${LATEST:0:10})**.
+
+          - An end-to-end validation build (no-cache, no-release) starts **in this same run**.
+          - **Do not merge** until the \`Base layer ${LATEST_TAG} validated\` comment appears and the \`base-layer-bump-validation\` status is green.
+          - meta-sysele-astrial-h15 between the old and new pin may include behavior changes, not
+            only fixes: read its own release notes for every tag in between before merging.
+          EOF
+          )"
+
+          echo "bumped=true" >> "$GITHUB_OUTPUT"
+          echo "new_ref=${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "new_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+  # Validation: builds this repo's current default branch against the candidate pin,
+  # publishes nothing. base_layer_ref overrides the pin because build.yml is read from
+  # the default branch here, not from the bump branch (which only exists to carry the
+  # pin change itself).
+  validate:
+    needs: detect-and-open
+    if: needs.detect-and-open.outputs.bumped == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build.yml
+    with:
+      release: none
+      use_cache: false
+      sbom: standard
+      base_layer_ref: ${{ needs.detect-and-open.outputs.new_ref }}
+    secrets: inherit
+
+  report:
+    needs: [detect-and-open, validate]
+    if: always() && needs.detect-and-open.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: Report validation result on the PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.detect-and-open.outputs.new_tag }}
+          BRANCH: ${{ needs.detect-and-open.outputs.branch }}
+          RESULT: ${{ needs.validate.result }}
+        run: |
+          set -euo pipefail
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SHA=$(gh pr view "$BRANCH" --json headRefOid -q .headRefOid)
+
+          if [ "$RESULT" = "success" ]; then
+            MSG="Base layer ${TAG} validated: build completed with no errors."
+            STATE=success
+            {
+              echo "## Base layer ${TAG} validated"
+              echo "Build completed with no errors on branch \`${BRANCH}\`. Safe to merge after review."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            MSG="Base layer ${TAG}: validation build FAILED (${RESULT}). Do not merge."
+            STATE=failure
+            {
+              echo "## Base layer ${TAG} NOT validated"
+              echo "Validation build failed (\`${RESULT}\`) on branch \`${BRANCH}\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "[Run log](${RUN_URL})" >> "$GITHUB_STEP_SUMMARY"
+
+          gh pr comment "$BRANCH" --body "${MSG} [Run](${RUN_URL})"
+          gh api "repos/${{ github.repository }}/statuses/${SHA}" \
+            -f state="${STATE}" \
+            -f context="base-layer-bump-validation" \
+            -f target_url="${RUN_URL}" \
+            -f description="${MSG:0:130}"
