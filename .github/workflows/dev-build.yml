@@ -1,0 +1,27 @@
+name: QBAstrial H15 - dev build
+
+run-name: QBAstrial H15 Dev Build • ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      sbom:
+        description: "none, standard (SPDX and cve-check) or full (also the checksums). Empty: the repository variable SYSELE_SBOM, or standard."
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+    with:
+      release: none
+      use_cache: true
+      # QBAstrial is the product actually shipped (meta-sysele-astrial-h15 is not):
+      # the SBOM matters more here, so the default is "standard", not "none".
+      sbom: ${{ inputs.sbom != '' && inputs.sbom || (vars.SYSELE_SBOM || 'standard') }}
+    secrets: inherit

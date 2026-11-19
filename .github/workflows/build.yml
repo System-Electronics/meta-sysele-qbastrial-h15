@@ -1,48 +1,57 @@
-name: QBAstrial H15 Yocto Build
+name: QBAstrial H15 Yocto Build (reusable)
 
-run-name: QBAstrial H15 Build • ${{ github.ref_name }} • ${{ github.event_name }}
-
-# Builds the QBAstrial H15 image on top of meta-sysele-astrial-h15 at a pinned commit.
-# A tag vX.Y.Z publishes a release; a manual run keeps the artifacts of the run.
+# Reusable build. One place for the build logic; callers decide:
+#   release        -> what to publish: none, continuous, or tagged
+#   use_cache      -> whether to use GitHub Actions Cache for SSTATE_DIR + DL_DIR (dev builds)
+#   sbom           -> none, standard (SPDX and cve-check) or full (also the checksums)
+#   base_layer_ref -> override the pinned meta-sysele-astrial-h15 commit, used to validate a
+#                     bump candidate before opening a PR (see bump-base-layer.yml)
+#   changelog      -> changelog text for a tagged release body, read from the annotated tag
+#
 # No pull_request trigger: the build uses the signing keys, which a fork must not reach.
 #
 # Runs on the organization's self-hosted runner (one machine, shared with meta-sysele-astrial-h15
 # and future products): free, persistent cache, and the CVE database kept fresh by the VPS timer,
 # instead of a paid GitHub-hosted runner building and fetching everything from scratch each time.
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      sbom:
-        description: "none, standard (SPDX and cve-check) or full (also the checksums). Empty: the repository variable SYSELE_SBOM, or standard."
+      release:
+        description: "none = artifacts only; continuous = overwrite the continuous prerelease; tagged = release on the tag."
         type: string
+        default: 'none'
+      use_cache:
+        description: "If true, use GitHub Actions Cache for sstate-cache + downloads (dev builds)."
+        type: boolean
+        default: false
+      sbom:
+        description: "none, standard (SPDX and cve-check) or full (also the checksums)."
+        type: string
+        default: 'none'
+      base_layer_ref:
+        description: "Override the pinned meta-sysele-astrial-h15 commit. Empty = BASE_LAYER_REF below."
+        type: string
+        required: false
         default: ''
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+'
-  schedule:
-    # Primo del mese, poco dopo l'aggiornamento notturno del database CVE (03:30 UTC) e dopo
-    # bump-poky di meta-sysele-astrial-h15 (03:00 UTC): canarino, non pubblica nulla di
-    # permanente (github.ref_type non e' 'tag' su uno schedulato).
-    - cron: '0 4 1 * *'
+      changelog:
+        description: "Changelog text for a tagged release body, read from the annotated tag's message."
+        type: string
+        required: false
+        default: ''
 
 env:
-  # SBOM level, see meta-sysele-bsp/kas/astrial-h15-machine.yml: none, standard (SPDX and cve-check)
-  # or full. QBAstrial e' il prodotto consegnato (meta-sysele-astrial-h15 non lo e'): la SBOM e'
-  # importante qui, quindi il default e' "standard", non "none".
-  SYSELE_SBOM: ${{ inputs.sbom || vars.SYSELE_SBOM || 'standard' }}
   # meta-sysele-astrial-h15, tag v1.2.2.
   BASE_LAYER_REPO: System-Electronics/meta-sysele-astrial-h15
   BASE_LAYER_REF: 6d15fef02e0e5547f48db8dd0b255d4b74238ba8
   HAILO_SOC_TAG: 1.12.0
   # sha256 of `openssl rsa -noout -modulus` of the customer key pair (modulus 9E71...).
   KEY_MODULUS_SHA256: baa96baf0ea08e7d31c3986972b9ea240132d265a882219ae5015b25f80f9155
+  SYSELE_SBOM: ${{ inputs.sbom }}
 
 jobs:
   build:
     runs-on: self-hosted
-    permissions:
-      contents: write
+    # Permissions are declared by the caller workflow, not here.
     steps:
       # First step: a missing or wrong key stops the run before the build.
       - name: Check the secure boot key
@@ -97,10 +106,10 @@ jobs:
 
       - name: Install KAS
         run: |
-          # Niente "sudo apt-get" qui: l'utente del runner non ha privilegi di root. I
-          # pacchetti di sistema per la build (build-essential, gawk, texinfo, python3-venv,
-          # ...) sono gia' installati una volta sola sulla macchina (condivisa con
-          # meta-sysele-astrial-h15, stesso elenco). Qui creiamo solo il venv per kas.
+          # No "sudo apt-get" here: the runner's user has no root privileges. The
+          # build's system packages (build-essential, gawk, texinfo, python3-venv,
+          # ...) are already installed once on the machine (shared with
+          # meta-sysele-astrial-h15, same list). Only the kas venv is created here.
           python3 -m venv "$RUNNER_TEMP/kas-venv"
           "$RUNNER_TEMP/kas-venv/bin/pip" install "kas==5.3"
           echo "$RUNNER_TEMP/kas-venv/bin" >> "$GITHUB_PATH"
@@ -121,15 +130,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.BASE_LAYER_REPO }}
-          ref: ${{ env.BASE_LAYER_REF }}
+          ref: ${{ inputs.base_layer_ref != '' && inputs.base_layer_ref || env.BASE_LAYER_REF }}
           path: meta-sysele-bsp
 
       - name: Persistent Yocto cache on the runner
-        # ~/yocto-cache/qbastrial-h15 sta fuori da _work: sopravvive a una workspace ripulita
-        # o a un runner riregistrato. E' lo stesso runner usato da meta-sysele-astrial-h15 e
-        # da futuri prodotti, quindi sstate e downloads sono separati per prodotto; il
-        # database CVE invece e' condiviso (non e' specifico di un prodotto), tenuto
-        # aggiornato dal timer della VPS: da qui un link CVE_CHECK -> ../cve-db.
+        # ~/yocto-cache/qbastrial-h15 lives outside _work: it survives a workspace
+        # cleanup or runner re-registration. It's the same runner used by
+        # meta-sysele-astrial-h15 and future products, so sstate and downloads are
+        # separated per product; the CVE database instead is shared (it isn't
+        # specific to one product), kept fresh by the VPS timer: hence the
+        # CVE_CHECK -> ../cve-db link here.
         if: runner.environment == 'self-hosted'
         run: |
           set -euo pipefail
@@ -166,8 +176,8 @@ jobs:
       - name: Check the CVE database on the runner
         if: env.SYSELE_SBOM != 'none' && runner.environment == 'self-hosted'
         run: |
-          # Il database lo tiene aggiornato il timer della VPS. Senza, la build prosegue ma
-          # il referto CVE manca, e una release senza referto non deve passare inosservata.
+          # Kept fresh by the VPS timer. The build proceeds without it, but a
+          # release with no CVE report must not pass unnoticed.
           DB="$HOME/yocto-cache/cve-db/nvdcve_2-2.db"
           if [ ! -s "$DB" ]; then
             echo "::error::No CVE database at $DB: the VPS update timer has not produced one"
@@ -207,7 +217,7 @@ jobs:
           export QBA_SWU_PRIVATE_KEY="$RUNNER_TEMP/qba-assets/swu_signing_key.pem"
 
           # BSP version shown on the board: the tag name, "unreleased" otherwise.
-          if [ "${{ github.ref_type }}" = "tag" ]; then
+          if [ "${{ inputs.release }}" = "tagged" ]; then
             export SYSELE_BSP_VERSION="${{ github.ref_name }}"
           fi
 
@@ -355,14 +365,14 @@ jobs:
           echo "SBOMs and CVE report:     ${SBOM_URL:-not produced, this build did not make one}"
 
       - name: Download Build Artifacts for Release
-        if: github.ref_type == 'tag'
+        if: inputs.release != 'none'
         uses: actions/download-artifact@v4
         with:
           name: qbastrial-h15-yocto-build
           path: ./release-files
 
       - name: Create Compressed Release Archive
-        if: github.ref_type == 'tag'
+        if: inputs.release != 'none'
         run: |
           cd release-files
           # upload-artifact keeps the paths below the common root of the files, so the images arrive under
@@ -377,7 +387,13 @@ jobs:
                    u-boot-tfa.itb scu_bl_cfg_a.bin program_spi_flash.sh; do
             [ -e "$f" ] || { echo "ERROR: $f is not in the archive after flattening" >&2; exit 1; }
           done
-          NAME="qbastrial-h15-yocto-build-${{ github.ref_name }}"
+          # Stable name for the continuous release, so the asset is replaced
+          # instead of accumulating. A tagged release includes the tag.
+          if [ "${{ inputs.release }}" = "tagged" ]; then
+            NAME="qbastrial-h15-yocto-build-${{ github.ref_name }}"
+          else
+            NAME="qbastrial-h15-yocto-build-continuous"
+          fi
           echo "ARCHIVE_NAME=$NAME" >> "$GITHUB_ENV"
           tar -czf "../$NAME.tar.gz" .
           cd ..
@@ -387,25 +403,61 @@ jobs:
         # Same files as inside the tar.gz, published again on their own so
         # anyone who only wants the SPDX or the CVE report does not have to
         # download and extract the whole archive.
-        if: github.ref_type == 'tag' && env.SYSELE_SBOM != 'none'
+        if: inputs.release != 'none' && env.SYSELE_SBOM != 'none'
         run: |
           set -euo pipefail
+          if [ "${{ inputs.release }}" = "tagged" ]; then
+            SUFFIX="${{ github.ref_name }}"
+          else
+            SUFFIX="continuous"
+          fi
+          echo "SBOM_PREFIX=qbastrial-h15-$SUFFIX" >> "$GITHUB_ENV"
           cd release-files
-          cp -p core-image-hailo-dev-astrial-h15-build.spdx.json "../qbastrial-h15-${{ github.ref_name }}-build.spdx.json"
-          cp -p core-image-hailo-dev-astrial-h15-deployed.spdx.json "../qbastrial-h15-${{ github.ref_name }}-deployed.spdx.json"
-          cp -p cve-summary.json "../qbastrial-h15-${{ github.ref_name }}-cve-summary.json"
-          cp -p cve-summary "../qbastrial-h15-${{ github.ref_name }}-cve-summary.txt"
+          cp -p core-image-hailo-dev-astrial-h15-build.spdx.json "../qbastrial-h15-$SUFFIX-build.spdx.json"
+          cp -p core-image-hailo-dev-astrial-h15-deployed.spdx.json "../qbastrial-h15-$SUFFIX-deployed.spdx.json"
+          cp -p cve-summary.json "../qbastrial-h15-$SUFFIX-cve-summary.json"
+          cp -p cve-summary "../qbastrial-h15-$SUFFIX-cve-summary.txt"
           cd ..
-          ls -lh "qbastrial-h15-${{ github.ref_name }}"-*.spdx.json "qbastrial-h15-${{ github.ref_name }}"-cve-summary.*
+          ls -lh "qbastrial-h15-$SUFFIX"-*.spdx.json "qbastrial-h15-$SUFFIX"-cve-summary.*
+
+      - name: Update the continuous prerelease
+        if: inputs.release == 'continuous'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: continuous
+          target_commitish: ${{ github.sha }}
+          name: Continuous build of ${{ github.ref_name }}
+          body: |
+            Latest automatic build of `${{ github.ref_name }}`. **Not a release.**
+
+            This one entry is rewritten on every build, so the link never changes and no
+            tags accumulate. For a fixed version, take a `v*` release instead.
+
+            Layer `meta-sysele-qbastrial-h15` on `meta-sysele-astrial-h15` at
+            `${{ inputs.base_layer_ref != '' && inputs.base_layer_ref || env.BASE_LAYER_REF }}`.
+
+            - Commit: ${{ github.sha }}
+            - Built: ${{ github.event.head_commit.timestamp }}
+          files: |
+            ${{ env.ARCHIVE_NAME }}.tar.gz
+            qbastrial-h15-*-build.spdx.json
+            qbastrial-h15-*-deployed.spdx.json
+            qbastrial-h15-*-cve-summary.json
+            qbastrial-h15-*-cve-summary.txt
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish the release for the pushed tag
-        if: github.ref_type == 'tag'
+        if: inputs.release == 'tagged'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           target_commitish: ${{ github.sha }}
           name: QBAstrial H15 BSP ${{ github.ref_name }}
           body: |
+            ${{ inputs.changelog }}
+
             Layer `meta-sysele-qbastrial-h15` on `meta-sysele-astrial-h15` at `${{ env.BASE_LAYER_REF }}`.
 
             - Commit: ${{ github.sha }}
