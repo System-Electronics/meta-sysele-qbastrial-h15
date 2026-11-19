@@ -1,0 +1,62 @@
+name: QBAstrial H15 - release
+run-name: QBAstrial H15 Release • ${{ github.ref_name }}
+
+# A release is born only from a tag pushed by hand, with an annotated message:
+# that message becomes the changelog in the GitHub Release.
+#
+#   git tag -a v1.0.0 -m "- Bullet list of what changed in this release"
+#   git push origin v1.0.0
+#
+# See the README for the vMAJOR.MINOR.PATCH scheme. A candidate is named
+# v1.0.0-rc1 and comes out marked prerelease.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+'
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changelog: ${{ steps.changelog.outputs.text }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Read the changelog from the annotated tag
+        id: changelog
+        run: |
+          TAG="${{ github.ref_name }}"
+          REF_SHA=$(gh api "repos/${{ github.repository }}/git/refs/tags/$TAG" --jq .object.sha)
+          REF_TYPE=$(gh api "repos/${{ github.repository }}/git/refs/tags/$TAG" --jq .object.type)
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "ERROR: $TAG is a lightweight tag with no message." >&2
+            echo "       Delete it and push an annotated tag instead: git tag -a $TAG -m '...'" >&2
+            exit 1
+          fi
+          MSG=$(gh api "repos/${{ github.repository }}/git/tags/$REF_SHA" --jq .message)
+          {
+            echo "text<<CHANGELOG_EOF"
+            echo "$MSG"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: write
+    with:
+      release: tagged
+      use_cache: false
+      # The tag build runs cold (no cache), so it regenerates the SBOM
+      # rather than pulling it from sstate.
+      sbom: standard
+      changelog: ${{ needs.resolve.outputs.changelog }}
+    secrets: inherit

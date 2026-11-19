@@ -60,10 +60,18 @@ bitbake hailo-update-image
 
 ## CI
 
-`.github/workflows/build.yml` runs on manual dispatch or on a tag `vX.Y.Z`. It pins `meta-sysele-astrial-h15` at
-`BASE_LAYER_REF`, verifies the keys, builds with kas and, on a tag, publishes the release. Secrets:
-`HAILO_CUSTOMER_KEYPAIR` (secure boot) and `SWU_SIGNING_KEY` (SWU signing). The run stops before the build if either is
-missing or invalid.
+`.github/workflows/build.yml` is the reusable build engine (same pattern as `meta-sysele-astrial-h15` and
+`meta-sysele-astrial-imx8`): it pins `meta-sysele-astrial-h15` at `BASE_LAYER_REF`, verifies the keys, and builds with
+kas. Secrets: `HAILO_CUSTOMER_KEYPAIR` (secure boot) and `SWU_SIGNING_KEY` (SWU signing). The run stops before the
+build if either is missing or invalid. Three thin callers decide what to build and publish:
+
+- `main.yml`: on push to `main` and once a month on schedule. Overwrites the single `continuous` prerelease, never
+  accumulates tags. The scheduled run is the canary: it also runs with `sbom: standard`, so it catches a CVE
+  regression unattended; a push keeps `sbom: none`.
+- `dev-build.yml`: manual dispatch, with GitHub Actions Cache enabled (dev build). Publishes only the run's own
+  artifacts.
+- `release.yml`: on a pushed tag `vX.Y.Z`. Reads the changelog from the tag's own annotated message and publishes
+  the release.
 
 Tag scheme `vMAJOR.MINOR.PATCH`, release candidates `-rcN`:
 
