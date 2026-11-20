@@ -1,0 +1,12 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          sysele-recovery
+# Required-Start:    $local_fs
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:
+# Short-Description: no boot menu entries are added on this product
+### END INIT INFO
+
+# The boot menu of the camera is set by qba-config: it does not offer the factory device tree selection.
+exit 0
