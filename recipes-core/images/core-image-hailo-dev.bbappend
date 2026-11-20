@@ -8,8 +8,9 @@ IMAGE_INSTALL:append = " packagegroup-hailo-imaging packagegroup-hailo-linux pac
 IMAGE_INSTALL:remove = "sysele-dsi-detection sysele-dsi-touch-test"
 
 # swupdate verifies the SWU with this key; qba-slot-sync keeps the SCU bootloader configuration in step with
-# the slot that booted; watchdog feeds /dev/watchdog.
-IMAGE_INSTALL:append = " swupdate-public-key qba-slot-sync watchdog"
+# the slot that booted; watchdog feeds /dev/watchdog; qba-config keeps the password, the address and the customer
+# applications on the data partition.
+IMAGE_INSTALL:append = " swupdate-public-key qba-slot-sync watchdog qba-config"
 
 # Tools for whoever develops on the camera.
 QBA_DEV_TOOLS = "gdb valgrind strace perf vim-tiny htop tmux tcpdump lsof rsync ethtool tree coreutils"
