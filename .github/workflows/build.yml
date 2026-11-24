@@ -397,6 +397,14 @@ jobs:
           cp -p meta-sysele-bsp/scripts/* .
           cp -p meta-hailo-soc/build/tmp/deploy/images/astrial-h15/* .
           cp -rp meta-hailo-soc/build/tmp/log/cve/* . 2>/dev/null || true
+
+          # Measured, not hand-typed, for the release notes: read from the
+          # image's own manifest, same approach already in use on
+          # meta-sysele-astrial-imx8.
+          KERNEL_VER=$(awk '$1 ~ /^kernel-[0-9]/ { sub(/-r[0-9]+$/, "", $3); print $3; exit }' \
+            core-image-hailo-dev-astrial-h15.manifest)
+          echo "KERNEL_VER=$KERNEL_VER" >> "$GITHUB_ENV"
+
           rm -rf meta-hailo-soc meta-sysele-bsp
           chmod +x *.sh *.py hailo15_spi_flash_program uart_boot_fw_loader
           for f in core-image-hailo-dev-astrial-h15.wic hailo-update-image-astrial-h15.swu \
@@ -506,6 +514,7 @@ jobs:
           - Yocto: ${{ env.YOCTO_CODENAME }} (poky `${{ env.POKY_REF }}`)
           - meta-hailo: `${{ env.META_HAILO_REF }}`
           - Hailo Vision Processor package: ${{ env.HAILO_SOC_TAG }}
+          - Kernel: ${{ env.KERNEL_VER }}
 
           Extract `${{ env.ARCHIVE_NAME }}.tar.gz`. `program_spi_flash.sh` programs the SPI-NOR once, through the
           mask ROM on UART1; `core-image-hailo-dev-astrial-h15-${{ github.ref_name }}.wic` goes to the eMMC over
