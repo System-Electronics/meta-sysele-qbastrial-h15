@@ -1,0 +1,49 @@
+#!/bin/sh
+# Bring a unit back to "never configured": the stored root password is removed and the configured marker is cleared.
+# The IP address, the SSH host keys and the customer applications are not touched. The next boot waits for a new
+# password on the serial console.
+#
+# Self contained (busybox is enough): it runs from the recovery update as well.
+#
+#   qba-reset-config [-d DATA_DEVICE] [-m MARKER_DEVICE] [-r MARKER_FORCE_RO] [-b MARKER_BLOCK]
+
+DATA_DEV=/dev/mmcblk1p5
+MARK_DEV=/dev/mmcblk1boot1
+MARK_RO=/sys/block/mmcblk1boot1/force_ro
+MARK_BLOCK=1023
+
+while getopts d:m:r:b: o; do
+    case "$o" in
+        d) DATA_DEV=$OPTARG ;;
+        m) MARK_DEV=$OPTARG ;;
+        r) MARK_RO=$OPTARG ;;
+        b) MARK_BLOCK=$OPTARG ;;
+        *) echo "usage: $0 [-d data_dev] [-m marker_dev] [-r force_ro] [-b block]" >&2; exit 2 ;;
+    esac
+done
+
+mnt=$(awk -v d="$DATA_DEV" '$1==d {print $2; exit}' /proc/mounts)
+here=0
+if [ -z "$mnt" ]; then
+    mnt=/tmp/qba-reset-data
+    mkdir -p "$mnt" || exit 1
+    mount -t ext4 "$DATA_DEV" "$mnt" || { echo "qba-reset-config: cannot mount $DATA_DEV" >&2; exit 1; }
+    here=1
+fi
+
+rm -f "$mnt/config/root-hash" "$mnt/config/root-hash".tmp.*
+rc=$?
+sync
+[ "$here" = 1 ] && umount "$mnt"
+[ "$rc" = 0 ] || { echo "qba-reset-config: cannot remove the stored password" >&2; exit 1; }
+
+# Marker last: if power is lost in between, the unit stays locked instead of falling back to a new unit.
+[ -w "$MARK_RO" ] && echo 0 > "$MARK_RO"
+dd if=/dev/zero of="$MARK_DEV" bs=4096 seek="$MARK_BLOCK" count=1 conv=notrunc 2>/dev/null
+rc=$?
+sync
+[ -w "$MARK_RO" ] && echo 1 > "$MARK_RO"
+[ "$rc" = 0 ] || { echo "qba-reset-config: cannot clear the marker" >&2; exit 1; }
+
+echo "qba-reset-config: configuration reset"
+exit 0

@@ -1,0 +1,438 @@
+#!/bin/sh
+# qba-config: persistent configuration of the QBAstrial H15 camera.
+#
+#   qba-config boot                              apply the stored configuration (init script)
+#   qba-config status                            show the state of the unit
+#   qba-config set-password [--stdin]            set the root password
+#   qba-config set-ip ADDRESS[/PREFIX] [GATEWAY] [--now]
+#   qba-config first-boot                        console setup of a unit that was never configured
+#
+# What is kept lives on the data partition, which no update rewrites: /data/config (password hash, IP address, SSH
+# host keys) and /data/app (applications, bind mounted on /home/root/apps). The root file system of either slot is
+# brought in line with it at every boot.
+#
+# States, decided at boot:
+#   configured  a password hash is stored: it is applied.
+#   new         no password and no marker, data partition present: root is locked until a password is set on the
+#               serial console. The network cannot set it.
+#   locked      the marker says the unit was configured, but the password is gone or the data partition cannot be
+#               read: root stays locked. It does not fall back to a default password.
+#   bringup     no data partition at all (image just written, before the partition layout is created): the image
+#               defaults are left alone.
+#
+# The marker is one 4 KiB block at the end of the second eMMC boot partition. It holds a magic string and the hash of
+# the eMMC CID, and is written when the first password is set. It is cleared by qba-reset-config only.
+
+DATA=${QBA_DATA:-/data}
+DATA_DEV=${QBA_DATA_DEV:-/dev/mmcblk1p5}
+CFG=$DATA/config
+MARK_DEV=${QBA_MARK_DEV:-/dev/mmcblk1boot1}
+MARK_RO=${QBA_MARK_RO:-/sys/block/mmcblk1boot1/force_ro}
+MARK_BLOCK=${QBA_MARK_BLOCK:-1023}
+CID_FILE=${QBA_CID_FILE:-/sys/block/mmcblk1/device/cid}
+SHADOW=${QBA_SHADOW:-/etc/shadow}
+SSH_DIR=${QBA_SSH_DIR:-/etc/ssh}
+IFACES=${QBA_IFACES:-/etc/network/interfaces}
+APPS=${QBA_APPS:-/home/root/apps}
+FW_PRINTENV=${QBA_FW_PRINTENV:-fw_printenv}
+FW_SETENV=${QBA_FW_SETENV:-fw_setenv}
+STATE_FILE=${QBA_STATE_FILE:-/run/qba-config.state}
+TEST=${QBA_TEST:-}
+
+log() { echo "qba-config: $*"; }
+err() { echo "qba-config: $*" >&2; }
+
+# ---- data partition -------------------------------------------------------------------------------------------
+
+data_mounted() {
+    if [ -n "$TEST" ]; then [ -d "$DATA" ]; return; fi
+    mountpoint -q "$DATA" 2>/dev/null
+}
+
+mount_data() {
+    data_mounted && return 0
+    [ -n "$TEST" ] && return 1
+    [ -b "$DATA_DEV" ] || return 1
+    mkdir -p "$DATA" 2>/dev/null
+    mount -t ext4 -o noatime "$DATA_DEV" "$DATA" 2>/dev/null || return 1
+    data_mounted
+}
+
+have_data_partition() {
+    if [ -n "$TEST" ]; then [ -d "$DATA" ]; return; fi
+    [ -b "$DATA_DEV" ]
+}
+
+# Replace the file $1 (mode $2) with what arrives on stdin, so that a power cut leaves the old or the new content.
+atomic_write() {
+    f=$1
+    t="$f.tmp.$$"
+    ( umask 077; cat > "$t" ) || { rm -f "$t"; return 1; }
+    chmod "$2" "$t" && sync && mv -f "$t" "$f" && sync
+}
+
+# ---- marker ---------------------------------------------------------------------------------------------------
+
+cid() { tr -d '[:space:]' < "$CID_FILE" 2>/dev/null; }
+
+marker_line() {
+    printf 'QBA-CFG-MARKER-1 %s' "$(printf '%s' "$(cid)" | sha256sum | cut -d' ' -f1)"
+}
+
+marker_present() {
+    [ -n "$(cid)" ] || return 1
+    got=$(dd if="$MARK_DEV" bs=4096 skip="$MARK_BLOCK" count=1 2>/dev/null | tr -d '\000' | head -n 1)
+    [ "$got" = "$(marker_line)" ]
+}
+
+# Write the block with the text $1 (an empty text clears it).
+marker_put() {
+    tmp=$(mktemp) || return 1
+    { [ -n "$1" ] && printf '%s\n' "$1"; head -c 4096 /dev/zero; } | head -c 4096 > "$tmp"
+    [ -w "$MARK_RO" ] && echo 0 > "$MARK_RO"
+    dd if="$tmp" of="$MARK_DEV" bs=4096 seek="$MARK_BLOCK" count=1 conv=notrunc 2>/dev/null
+    rc=$?
+    sync
+    [ -w "$MARK_RO" ] && echo 1 > "$MARK_RO"
+    rm -f "$tmp"
+    return $rc
+}
+
+marker_set() {
+    [ -n "$(cid)" ] || { err "the eMMC CID cannot be read: marker not written"; return 1; }
+    marker_put "$(marker_line)" && marker_present
+}
+
+# ---- root password --------------------------------------------------------------------------------------------
+
+root_hash() { awk -F: '$1=="root" {print $2}' "$SHADOW"; }
+
+set_root_hash() {
+    t=$(mktemp "$SHADOW.XXXXXX") || return 1
+    awk -F: -v h="$1" 'BEGIN {OFS=":"} $1=="root" {$2=h} {print}' "$SHADOW" > "$t" || { rm -f "$t"; return 1; }
+    chmod 0400 "$t" && mv -f "$t" "$SHADOW"
+}
+
+lock_root() {
+    [ "$(root_hash)" = "!" ] && return 0
+    set_root_hash '!' && log "root is locked"
+}
+
+# ---- state ----------------------------------------------------------------------------------------------------
+
+STATE=
+DATA_OK=0
+
+compute_state() {
+    DATA_OK=0
+    mount_data && DATA_OK=1
+    h=
+    [ "$DATA_OK" = 1 ] && h=$(cat "$CFG/root-hash" 2>/dev/null)
+    case "$h" in
+        '$'*) STATE=configured; return ;;
+    esac
+    if [ -z "$(cid)" ]; then
+        # Without the CID the marker cannot be told: never assume a new unit.
+        if have_data_partition; then STATE=locked; else STATE=bringup; fi
+    elif marker_present; then
+        STATE=locked
+    elif [ "$DATA_OK" = 1 ]; then
+        STATE=new
+    elif have_data_partition; then
+        STATE=locked
+    else
+        STATE=bringup
+    fi
+}
+
+# ---- SSH host keys --------------------------------------------------------------------------------------------
+
+# One set per unit, made on the first boot and kept: the image carries keys made at build time, the same for every
+# unit, which are never used.
+ssh_keys() {
+    d=$CFG/ssh
+    mkdir -p "$d" && chmod 700 "$d" || return 1
+    for t in rsa ecdsa ed25519; do
+        k=$d/ssh_host_${t}_key
+        if [ ! -s "$k" ] || [ ! -s "$k.pub" ]; then
+            rm -f "$k" "$k.pub" "$k.new" "$k.new.pub"
+            bits=
+            [ "$t" = rsa ] && bits="-b 3072"
+            if ssh-keygen -q -t "$t" $bits -N '' -C "root@$(hostname)" -f "$k.new" > /dev/null 2>&1; then
+                mv -f "$k.new.pub" "$k.pub" && mv -f "$k.new" "$k" && sync
+            else
+                err "cannot make the $t host key"
+                rm -f "$k.new" "$k.new.pub"
+                continue
+            fi
+        fi
+        cp -f "$k" "$SSH_DIR/ssh_host_${t}_key" && chmod 0600 "$SSH_DIR/ssh_host_${t}_key"
+        cp -f "$k.pub" "$SSH_DIR/ssh_host_${t}_key.pub" && chmod 0644 "$SSH_DIR/ssh_host_${t}_key.pub"
+    done
+}
+
+# ---- network --------------------------------------------------------------------------------------------------
+
+# Value of a key in the "iface eth0 inet static" stanza of the interfaces file.
+iface_get() {
+    awk -v k="$1" '
+        /^iface[ \t]+eth0[ \t]+inet[ \t]+static/ {on = 1; next}
+        /^(iface|auto|allow)/ {on = 0}
+        on && $1 == k {print $2; exit}' "$IFACES" 2>/dev/null
+}
+
+cfg_get() { sed -n "s/^$1=//p" "$CFG/network" 2>/dev/null | head -n 1; }
+
+valid_ip() {
+    printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+    oldifs=$IFS; IFS=.; set -- $1; IFS=$oldifs
+    for o in "$@"; do [ "$o" -le 255 ] || return 1; done
+}
+
+prefix_to_mask() {
+    p=$1
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$p" -ge 1 ] && [ "$p" -le 30 ] || return 1
+    m=; i=0
+    while [ "$i" -lt 4 ]; do
+        if [ "$p" -ge 8 ]; then o=255; p=$((p - 8)); else o=$((256 - (1 << (8 - p)))); p=0; fi
+        m="$m${m:+.}$o"
+        i=$((i + 1))
+    done
+    echo "$m"
+}
+
+write_interfaces() {
+    a=$1; m=$2; g=$3
+    t=$(mktemp "$IFACES.XXXXXX") || return 1
+    {
+        echo "# Generated by qba-config from /data/config/network. Change it with: qba-config set-ip"
+        echo "auto lo"
+        echo "iface lo inet loopback"
+        echo
+        echo "auto eth0"
+        echo "iface eth0 inet static"
+        echo "        address $a"
+        echo "        netmask $m"
+        [ -n "$g" ] && echo "        gateway $g"
+        echo
+        echo "iface eth1 inet dhcp"
+    } > "$t"
+    if [ "$(cat "$t")" = "$(cat "$IFACES" 2>/dev/null)" ]; then rm -f "$t"; return 0; fi
+    chmod 0644 "$t" && mv -f "$t" "$IFACES" && log "network: $a/$m${g:+ via $g}"
+}
+
+# First boot after an update from an image that kept the address its own way: take it over.
+network_capture() {
+    [ -s "$CFG/network" ] && return 0
+    a=$(iface_get address); m=$(iface_get netmask); g=$(iface_get gateway)
+    [ -n "$a" ] && [ -n "$m" ] || return 0
+    { echo "ADDRESS=$a"; echo "NETMASK=$m"; [ -n "$g" ] && echo "GATEWAY=$g"; } | atomic_write "$CFG/network" 0600
+}
+
+network_apply() {
+    network_capture
+    a=$(cfg_get ADDRESS); m=$(cfg_get NETMASK); g=$(cfg_get GATEWAY)
+    valid_ip "$a" && valid_ip "$m" || return 0
+    [ -z "$g" ] || valid_ip "$g" || g=
+    write_interfaces "$a" "$m" "$g"
+}
+
+# ---- applications ---------------------------------------------------------------------------------------------
+
+# The customer installs under /home/root/apps, which is in the root file system and would go with an update.
+# /data/app replaces it. The first time it is filled with what the image ships there.
+apps_bind() {
+    mkdir -p "$DATA/app" "$APPS" || return 1
+    if [ ! -f "$DATA/app/.qba-seeded" ]; then
+        cp -a "$APPS/." "$DATA/app/" 2>/dev/null && : > "$DATA/app/.qba-seeded" && sync
+    fi
+    [ -f "$DATA/app/.qba-seeded" ] || { err "applications: not seeded, the image copy stays"; return 1; }
+    [ -n "$TEST" ] && return 0
+    mountpoint -q "$APPS" 2>/dev/null || mount --bind "$DATA/app" "$APPS"
+}
+
+# ---- U-Boot boot menu -----------------------------------------------------------------------------------------
+
+# An update rewrites the U-Boot environment with the stock one, whose menu offers to boot from SD or NFS, to write an
+# unsigned image from TFTP and to switch the device tree. The menu is set back to what a unit in the field needs. It
+# is written only when it differs, so a boot does not touch the SPI-NOR in the normal case.
+menu_lock() {
+    env_now=$($FW_PRINTENV 2> /dev/null)
+    [ -n "$env_now" ] || return 0
+    has() { printf '%s\n' "$env_now" | grep -q "^$1="; }
+    wantf=$(mktemp) || return 0
+    {
+        echo 'Autodetect=if test ${boot_image_mode} = 1; then run boot_swupdate_mmc; exit 1; fi; if test "${auto_uboot_update_enable}" = "yes"; then run auto_uboot_update; exit 1; fi; echo Trying Boot from eMMC; run boot_mmc1; echo ERROR: Boot from eMMC failed'
+        has boot_mmc1 && echo 'Boot from eMMC=run boot_mmc1'
+        has boot_swupdate_mmc && echo 'SWUpdate=run boot_swupdate_mmc'
+        has boot_swupdate_sdio1_ab && echo 'SWUpdate AB board init=run boot_swupdate_sdio1_ab'
+        if has swupdate_load_tftp && has boot_swupdate && has setup_swupdate_sdio1_filesystem_device; then
+            echo 'Recovery, reset the configuration=run setup_swupdate_sdio1_filesystem_device && setenv swupdate_update_modes reset-config && run swupdate_load_tftp && run boot_swupdate'
+        fi
+    } > "$wantf"
+    script=$(mktemp) || { rm -f "$wantf"; return 0; }
+    : > "$script"
+    i=0; changed=0
+    while IFS= read -r e; do
+        cur=$(printf '%s\n' "$env_now" | sed -n "s/^bootmenu_$i=//p")
+        [ "$cur" = "$e" ] || { printf 'bootmenu_%s=%s\n' "$i" "$e" >> "$script"; changed=1; }
+        i=$((i + 1))
+    done < "$wantf"
+    for idx in $(printf '%s\n' "$env_now" | sed -n 's/^bootmenu_\([0-9][0-9]*\)=..*/\1/p'); do
+        if [ "$idx" -ge "$i" ]; then printf 'bootmenu_%s=\n' "$idx" >> "$script"; changed=1; fi
+    done
+    if [ "$changed" = 1 ]; then
+        if $FW_SETENV -s "$script"; then log "boot menu set"; else err "boot menu: fw_setenv failed"; fi
+    fi
+    rm -f "$wantf" "$script"
+}
+
+# ---- commands -------------------------------------------------------------------------------------------------
+
+cmd_boot() {
+    compute_state
+    echo "$STATE" > "$STATE_FILE"
+    log "state: $STATE"
+    [ "$STATE" = bringup ] && return 0
+    if [ "$DATA_OK" = 1 ]; then
+        ssh_keys
+        network_apply
+        apps_bind
+    fi
+    case "$STATE" in
+        configured)
+            h=$(cat "$CFG/root-hash")
+            [ "$(root_hash)" = "$h" ] || set_root_hash "$h"
+            marker_present || { marker_set && log "marker restored"; }
+            ;;
+        *)
+            lock_root
+            ;;
+    esac
+    menu_lock
+}
+
+cmd_status() {
+    compute_state
+    echo "state:        $STATE"
+    echo "data:         $([ "$DATA_OK" = 1 ] && echo mounted || echo unavailable)"
+    echo "marker:       $(marker_present && echo present || echo absent)"
+    echo "emmc cid:     $(cid)"
+    echo "root hash:    $(case "$(root_hash)" in '!'|'*') echo locked ;; '$'*) echo set ;; *) echo other ;; esac)"
+    echo "stored hash:  $([ -s "$CFG/root-hash" ] && echo yes || echo no)"
+    echo "address:      $(iface_get address)/$(iface_get netmask) gateway $(iface_get gateway)"
+    echo "applications: $(mountpoint -q "$APPS" 2>/dev/null && echo "on $DATA/app" || echo "in the root file system")"
+}
+
+# Store and apply the password hash $1.
+commit_password() {
+    mkdir -p "$CFG" && chmod 700 "$CFG" || { err "cannot create $CFG"; return 1; }
+    printf '%s\n' "$1" | atomic_write "$CFG/root-hash" 0600 || { err "cannot store the password"; return 1; }
+    set_root_hash "$1" || { err "cannot set the password"; return 1; }
+    marker_set || err "the marker could not be written: it is written again at the next boot"
+    STATE=configured
+    echo configured > "$STATE_FILE" 2>/dev/null
+}
+
+PW=
+prompt_password() {
+    while :; do
+        printf 'New root password (at least 8 characters): '
+        read -r -s p1 || return 1
+        echo
+        printf 'Repeat the password: '
+        read -r -s p2 || return 1
+        echo
+        [ "$p1" = "$p2" ] || { echo "The two passwords differ."; continue; }
+        [ "${#p1}" -ge 8 ] || { echo "The password is too short."; continue; }
+        PW=$p1
+        return 0
+    done
+}
+
+make_hash() { printf '%s' "$1" | openssl passwd -6 -stdin; }
+
+require_writable() {
+    compute_state
+    case "$STATE" in
+        configured|new) ;;
+        *) err "not available in the state '$STATE'"; return 1 ;;
+    esac
+    [ "$DATA_OK" = 1 ] || { err "the data partition is not available"; return 1; }
+}
+
+cmd_set_password() {
+    require_writable || return 1
+    if [ "$1" = "--stdin" ]; then
+        read -r PW || return 1
+        [ "${#PW}" -ge 8 ] || { err "the password is too short"; return 1; }
+    else
+        prompt_password || return 1
+    fi
+    hash=$(make_hash "$PW") && case "$hash" in '$'*) ;; *) false ;; esac || { err "cannot hash the password"; return 1; }
+    commit_password "$hash" && log "password set"
+}
+
+cmd_set_ip() {
+    now=0; a=; g=
+    for x in "$@"; do
+        case "$x" in
+            --now) now=1 ;;
+            *) if [ -z "$a" ]; then a=$x; else g=$x; fi ;;
+        esac
+    done
+    [ -n "$a" ] || { err "usage: qba-config set-ip ADDRESS[/PREFIX] [GATEWAY] [--now]"; return 1; }
+    require_writable || return 1
+    case "$a" in
+        */*) m=$(prefix_to_mask "${a#*/}") || { err "invalid prefix"; return 1; }; a=${a%/*} ;;
+        *) m=$(cfg_get NETMASK); [ -n "$m" ] || m=255.255.255.0 ;;
+    esac
+    valid_ip "$a" || { err "invalid address"; return 1; }
+    [ -z "$g" ] || valid_ip "$g" || { err "invalid gateway"; return 1; }
+    { echo "ADDRESS=$a"; echo "NETMASK=$m"; [ -n "$g" ] && echo "GATEWAY=$g"; } | atomic_write "$CFG/network" 0600 || return 1
+    write_interfaces "$a" "$m" "$g"
+    log "address $a/$m stored"
+    if [ "$now" = 1 ]; then
+        log "applying now"
+        ( sleep 1; /etc/init.d/networking restart ) > /dev/null 2>&1 &
+    else
+        log "it applies at the next boot, or now with --now"
+    fi
+}
+
+cmd_first_boot() {
+    compute_state
+    [ "$STATE" = new ] || return 0
+    echo
+    echo "QBAstrial H15: first configuration"
+    echo "This unit has no password yet. Choose the password of the root account."
+    echo
+    prompt_password || return 1
+    hash=$(make_hash "$PW") && case "$hash" in '$'*) ;; *) false ;; esac || { err "cannot hash the password"; return 1; }
+    commit_password "$hash" || return 1
+    cur="$(iface_get address)/$(iface_get netmask)"
+    echo
+    printf 'IP address with prefix, for example 192.168.1.20/24 (Enter keeps %s): ' "$cur"
+    read -r ip || ip=
+    if [ -n "$ip" ]; then
+        printf 'Gateway (Enter for none): '
+        read -r gw || gw=
+        cmd_set_ip "$ip" $gw --now
+    fi
+    echo
+    echo "Configuration saved. You can log in as root."
+    echo
+}
+
+case "${1:-status}" in
+    boot)         cmd_boot ;;
+    status)       cmd_status ;;
+    set-password) shift; cmd_set_password "$@" ;;
+    set-ip)       shift; cmd_set_ip "$@" ;;
+    first-boot)   cmd_first_boot ;;
+    *)
+        err "usage: qba-config {boot|status|set-password [--stdin]|set-ip ADDRESS[/PREFIX] [GATEWAY] [--now]|first-boot}"
+        exit 1
+        ;;
+esac

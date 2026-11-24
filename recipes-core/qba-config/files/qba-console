@@ -1,0 +1,29 @@
+#!/bin/sh
+# Serial console entry of inittab. On a unit that was never configured it asks for the root password, then it runs
+# the usual getty. Arguments are those of start_getty: baud rate, tty name, terminal type.
+
+tty=/dev/$2
+
+# qba-config boot writes the state early in the boot.
+n=0
+while [ ! -s /run/qba-config.state ] && [ "$n" -lt 90 ]; do
+    sleep 1
+    n=$((n + 1))
+done
+state=$(cat /run/qba-config.state 2>/dev/null)
+
+if [ -c "$tty" ]; then
+    case "$state" in
+        new)
+            sleep 2
+            until /usr/sbin/qba-config first-boot < "$tty" > "$tty" 2>&1; do
+                sleep 3
+            done
+            ;;
+        locked)
+            printf '\r\nThis unit is locked: its configuration is missing.\r\nContact System Electronics for the recovery procedure.\r\n\r\n' > "$tty"
+            ;;
+    esac
+fi
+
+exec /bin/start_getty "$@"
