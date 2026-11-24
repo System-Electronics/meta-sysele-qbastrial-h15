@@ -120,6 +120,8 @@ jobs:
           # `git clone meta-hailo-soc` would fail on the second one. The Yocto
           # cache lives in yocto-cache/, which this does not touch.
           rm -rf meta-hailo-soc release-files failure-logs /tmp/failed.txt
+          rm -f qbastrial-h15-*-build.spdx.json qbastrial-h15-*-deployed.spdx.json \
+                qbastrial-h15-*-cve-summary.json qbastrial-h15-*-cve-summary.txt
 
       - name: Checkout this layer
         uses: actions/checkout@v4
@@ -395,6 +397,13 @@ jobs:
             NAME="qbastrial-h15-yocto-build-continuous"
           fi
           echo "ARCHIVE_NAME=$NAME" >> "$GITHUB_ENV"
+          # Set unconditionally, even when this build has no SBOM: the
+          # release step below references it regardless of SYSELE_SBOM.
+          if [ "${{ inputs.release }}" = "tagged" ]; then
+            echo "SBOM_PREFIX=qbastrial-h15-${{ github.ref_name }}" >> "$GITHUB_ENV"
+          else
+            echo "SBOM_PREFIX=qbastrial-h15-continuous" >> "$GITHUB_ENV"
+          fi
           tar -czf "../$NAME.tar.gz" .
           cd ..
           ls -lh "$NAME.tar.gz"
@@ -440,10 +449,10 @@ jobs:
             - Built: ${{ github.event.head_commit.timestamp }}
           files: |
             ${{ env.ARCHIVE_NAME }}.tar.gz
-            qbastrial-h15-*-build.spdx.json
-            qbastrial-h15-*-deployed.spdx.json
-            qbastrial-h15-*-cve-summary.json
-            qbastrial-h15-*-cve-summary.txt
+            ${{ env.SBOM_PREFIX }}-build.spdx.json
+            ${{ env.SBOM_PREFIX }}-deployed.spdx.json
+            ${{ env.SBOM_PREFIX }}-cve-summary.json
+            ${{ env.SBOM_PREFIX }}-cve-summary.txt
           prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -477,10 +486,10 @@ jobs:
             whole archive.
           files: |
             ${{ env.ARCHIVE_NAME }}.tar.gz
-            qbastrial-h15-*-build.spdx.json
-            qbastrial-h15-*-deployed.spdx.json
-            qbastrial-h15-*-cve-summary.json
-            qbastrial-h15-*-cve-summary.txt
+            ${{ env.SBOM_PREFIX }}-build.spdx.json
+            ${{ env.SBOM_PREFIX }}-deployed.spdx.json
+            ${{ env.SBOM_PREFIX }}-cve-summary.json
+            ${{ env.SBOM_PREFIX }}-cve-summary.txt
           prerelease: ${{ contains(github.ref_name, '-rc') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
