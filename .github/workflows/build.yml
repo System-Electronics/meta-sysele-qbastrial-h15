@@ -161,6 +161,19 @@ jobs:
           cp -r ../meta-sysele-qbastrial-h15 ./meta-sysele-qbastrial-h15
           ln -sfn "$HOME/yocto-cache/qbastrial-h15" yocto-cache
 
+          # Measured, not hand-typed, for the release notes: read from the
+          # checked-out base layer instead of keeping a second copy of these
+          # values here.
+          YOCTO_CODENAME=$(sed -n 's/^LAYERSERIES_COMPAT_meta-sysele-bsp = "\(.*\)"$/\1/p' \
+            meta-sysele-bsp/conf/layer.conf)
+          POKY_REF=$(awk '/^  poky:/{f=1} f && /refspec:/{sub(/.*refspec:[ \t]*/,""); print; exit}' \
+            meta-sysele-bsp/kas/astrial-h15-machine.yml)
+          META_HAILO_REF=$(awk '/^  meta-hailo:/{f=1} f && /refspec:/{sub(/.*refspec:[ \t]*/,""); print; exit}' \
+            meta-sysele-bsp/kas/astrial-h15-vpu-base.yml)
+          echo "YOCTO_CODENAME=$YOCTO_CODENAME" >> "$GITHUB_ENV"
+          echo "POKY_REF=$POKY_REF" >> "$GITHUB_ENV"
+          echo "META_HAILO_REF=$META_HAILO_REF" >> "$GITHUB_ENV"
+
           cat > qbastrial-h15-ci.yml <<'KAS'
           header:
             version: 11
@@ -476,6 +489,40 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Write the release notes
+        # Quoted heredoc: the ${{ }} expressions below are substituted by
+        # Actions before the shell ever sees this, but the changelog text
+        # itself (from the tag message) is not meant to be, so the shell
+        # must not interpret it either (it can contain $ or backticks).
+        # One file, used both as the release body and as a release asset.
+        if: inputs.release == 'tagged'
+        run: |
+          cat > RELEASE_NOTES.txt <<'NOTES_EOF'
+          ${{ inputs.changelog }}
+
+          Layer `meta-sysele-qbastrial-h15` on `meta-sysele-astrial-h15` at `${{ env.BASE_LAYER_REF }}`.
+
+          - Commit: ${{ github.sha }}
+          - Yocto: ${{ env.YOCTO_CODENAME }} (poky `${{ env.POKY_REF }}`)
+          - meta-hailo: `${{ env.META_HAILO_REF }}`
+          - Hailo Vision Processor package: ${{ env.HAILO_SOC_TAG }}
+
+          Extract `${{ env.ARCHIVE_NAME }}.tar.gz`. `program_spi_flash.sh` programs the SPI-NOR once, through the
+          mask ROM on UART1; `core-image-hailo-dev-astrial-h15-${{ github.ref_name }}.wic` goes to the eMMC over
+          TFTP from the U-Boot menu (the image and the SWU carry the version in their own name; everything
+          `program_spi_flash.sh` touches keeps its plain name, since that script hardcodes it).
+
+          The SWU is signed (RSA-PSS). The images accept only the key with public fingerprint
+          `${{ env.SWU_PUBKEY_FINGERPRINT }}` (sha256 of the DER, first 16 hex digits).
+
+          Flashing requires Hailo's `hailo15_board_tools`, not included.
+
+          If the build produced an SBOM (`*-build.spdx.json`, `*-deployed.spdx.json`: software bill of materials,
+          SPDX 2.2) and a CVE report (`cve-summary.json`, `cve-summary`), they are also attached to this release
+          individually (`qbastrial-h15-${{ github.ref_name }}-*`), for anyone who only wants those and not the
+          whole archive.
+          NOTES_EOF
+
       - name: Publish the release for the pushed tag
         if: inputs.release == 'tagged'
         uses: softprops/action-gh-release@v3
@@ -483,30 +530,10 @@ jobs:
           tag_name: ${{ github.ref_name }}
           target_commitish: ${{ github.sha }}
           name: QBAstrial H15 BSP ${{ github.ref_name }}
-          body: |
-            ${{ inputs.changelog }}
-
-            Layer `meta-sysele-qbastrial-h15` on `meta-sysele-astrial-h15` at `${{ env.BASE_LAYER_REF }}`.
-
-            - Commit: ${{ github.sha }}
-            - Yocto: kirkstone (poky `yocto-4.0.35`), Hailo Vision Processor package ${{ env.HAILO_SOC_TAG }}
-
-            Extract `${{ env.ARCHIVE_NAME }}.tar.gz`. `program_spi_flash.sh` programs the SPI-NOR once, through the
-            mask ROM on UART1; `core-image-hailo-dev-astrial-h15-${{ github.ref_name }}.wic` goes to the eMMC over
-            TFTP from the U-Boot menu (the image and the SWU carry the version in their own name; everything
-            `program_spi_flash.sh` touches keeps its plain name, since that script hardcodes it).
-
-            The SWU is signed (RSA-PSS). The images accept only the key with public fingerprint
-            `${{ env.SWU_PUBKEY_FINGERPRINT }}` (sha256 of the DER, first 16 hex digits).
-
-            Flashing requires Hailo's `hailo15_board_tools`, not included.
-
-            If the build produced an SBOM (`*-build.spdx.json`, `*-deployed.spdx.json`: software bill of materials,
-            SPDX 2.2) and a CVE report (`cve-summary.json`, `cve-summary`), they are also attached to this release
-            individually (`qbastrial-h15-${{ github.ref_name }}-*`), for anyone who only wants those and not the
-            whole archive.
+          body_path: RELEASE_NOTES.txt
           files: |
             ${{ env.ARCHIVE_NAME }}.tar.gz
+            RELEASE_NOTES.txt
             ${{ env.SBOM_PREFIX }}-build.spdx.json
             ${{ env.SBOM_PREFIX }}-deployed.spdx.json
             ${{ env.SBOM_PREFIX }}-cve-summary.json
